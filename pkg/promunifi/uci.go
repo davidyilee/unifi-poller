@@ -6,7 +6,7 @@ import (
 
 // exportUCI is a collection of stats from UCI.
 func (u *promUnifi) exportUCI(r report, d *unifi.UCI) {
-	if !d.Adopted.Val || d.Locating.Val {
+	if (!d.Adopted.Val && !d.AdoptionCompleted.Val) || d.Locating.Val {
 		return
 	}
 
@@ -17,12 +17,12 @@ func (u *promUnifi) exportUCI(r report, d *unifi.UCI) {
 
 	baseLabels := []string{d.Type, d.SiteName, d.Name, d.SourceName}
 	baseInfoLabels := []string{d.Version, d.Model, d.Serial, d.Mac, d.IP, d.ID}
-	
+
 	u.exportWithTags(r, d.Tags, func(tagLabels []string) {
 		tag := tagLabels[0]
 		labels := append(baseLabels, tag)
 		infoLabels := append(baseInfoLabels, tag)
-		
+
 		// Shared data (all devices do this).
 		u.exportBYTstats(r, labels, d.TxBytes, d.RxBytes)
 
@@ -36,6 +36,15 @@ func (u *promUnifi) exportUCI(r report, d *unifi.UCI) {
 		r.send([]*metric{
 			{u.Device.Info, gauge, 1.0, append(baseLabels, infoLabels...)},
 			{u.Device.Uptime, gauge, d.Uptime, labels},
+			{u.Device.Internet, gauge, d.Internet.Val, labels},
 		})
+
+		if d.CiStateTable != nil {
+			r.send([]*metric{{
+				u.Device.CiStateInfo, gauge, 1.0,
+				append(labels, d.CiStateTable.CIState, d.CiStateTable.CISwDlStatus,
+					d.CiStateTable.CIMac, d.CiStateTable.CIVersion, d.CiStateTable.CIMode),
+			}})
+		}
 	})
 }
