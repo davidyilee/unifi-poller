@@ -1,0 +1,35 @@
+version: "2"
+linters:
+  enable:
+    - nlreturn
+    - revive
+    - tagalign
+    - testpackage
+    - wsl_v5
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+  settings:
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  fix: true
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

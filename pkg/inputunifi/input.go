@@ -1,0 +1,533 @@
+// Package inputunifi implements the poller.Input interface and bridges the gap between
+// metrics from the unifi library, and the augments required to pump them into unifi-poller.
+package inputunifi
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/unpoller/unifi/v5"
+	"github.com/unpoller/unpoller/pkg/poller"
+	"golift.io/cnfg"
+)
+
+// PluginName is the name of this input plugin.
+const PluginName = "unifi"
+
+const (
+	defaultURL     = "https://127.0.0.1:8443"
+	defaultUser    = "unifipoller"
+	defaultPass    = "unifipoller"
+	defaultSite    = "all"
+	defaultTimeout = 60 * time.Second
+)
+
+// InputUnifi contains the running data.
+type InputUnifi struct {
+	*Config    `json:"unifi" toml:"unifi" xml:"unifi" yaml:"unifi"`
+	dynamic    map[string]*Controller
+	sync.Mutex // to lock the map above.
+	Logger     poller.Logger
+}
+
+// Controller represents the configuration for a UniFi Controller.
+// Each polled controller may have its own configuration.
+type Controller struct {
+	VerifySSL               *bool         `json:"verify_ssl"                 toml:"verify_ssl"                 xml:"verify_ssl"                 yaml:"verify_ssl"`
+	SaveAnomal              *bool         `json:"save_anomalies"             toml:"save_anomalies"             xml:"save_anomalies"             yaml:"save_anomalies"`
+	SaveAlarms              *bool         `json:"save_alarms"                toml:"save_alarms"                xml:"save_alarms"                yaml:"save_alarms"`
+	SaveEvents              *bool         `json:"save_events"                toml:"save_events"                xml:"save_events"                yaml:"save_events"`
+	SaveSyslog              *bool         `json:"save_syslog"                toml:"save_syslog"                xml:"save_syslog"                yaml:"save_syslog"`
+	SaveProtectLogs         *bool         `json:"save_protect_logs"          toml:"save_protect_logs"          xml:"save_protect_logs"          yaml:"save_protect_logs"`
+	ProtectThumbnails       *bool         `json:"protect_thumbnails"         toml:"protect_thumbnails"         xml:"protect_thumbnails"         yaml:"protect_thumbnails"`
+	SaveIDs                 *bool         `json:"save_ids"                   toml:"save_ids"                   xml:"save_ids"                   yaml:"save_ids"`
+	SaveDPI                 *bool         `json:"save_dpi"                   toml:"save_dpi"                   xml:"save_dpi"                   yaml:"save_dpi"`
+	SaveTraffic             *bool         `json:"save_traffic"               toml:"save_traffic"               xml:"save_traffic"               yaml:"save_traffic"`
+	SaveRogue               *bool         `json:"save_rogue"                 toml:"save_rogue"                 xml:"save_rogue"                 yaml:"save_rogue"`
+	HashPII                 *bool         `json:"hash_pii"                   toml:"hash_pii"                   xml:"hash_pii"                   yaml:"hash_pii"`
+	DropPII                 *bool         `json:"drop_pii"                   toml:"drop_pii"                   xml:"drop_pii"                   yaml:"drop_pii"`
+	SaveSites               *bool         `json:"save_sites"                 toml:"save_sites"                 xml:"save_sites"                 yaml:"save_sites"`
+	Timeout                 cnfg.Duration `json:"timeout"                    toml:"timeout"                    xml:"timeout"                    yaml:"timeout"`
+	CertPaths               []string      `json:"ssl_cert_paths"             toml:"ssl_cert_paths"             xml:"ssl_cert_path"              yaml:"ssl_cert_paths"`
+	User                    string        `json:"user"                       toml:"user"                       xml:"user"                       yaml:"user"`
+	Pass                    string        `json:"pass"                       toml:"pass"                       xml:"pass"                       yaml:"pass"`
+	APIKey                  string        `json:"api_key"                    toml:"api_key"                    xml:"api_key"                    yaml:"api_key"`
+	URL                     string        `json:"url"                        toml:"url"                        xml:"url"                        yaml:"url"`
+	Sites                   []string      `json:"sites"                      toml:"sites"                      xml:"site"                       yaml:"sites"`
+	DefaultSiteNameOverride string        `json:"default_site_name_override" toml:"default_site_name_override" xml:"default_site_name_override" yaml:"default_site_name_override"`
+	Remote                  bool          `json:"remote"                     toml:"remote"                     xml:"remote,attr"                yaml:"remote"`
+	ConsoleID               string        `json:"console_id,omitempty"       toml:"console_id,omitempty"       xml:"console_id,omitempty"       yaml:"console_id,omitempty"`
+	Unifi                   *unifi.Unifi  `json:"-"                          toml:"-"                          xml:"-"                          yaml:"-"`
+	ID                      string        `json:"id,omitempty"` // this is an output, not an input.
+}
+
+// Config contains our configuration data.
+type Config struct {
+	sync.RWMutex               // locks the Unifi struct member when re-authing to unifi.
+	Default      Controller    `json:"defaults"       toml:"defaults"       xml:"default"        yaml:"defaults"`
+	Disable      bool          `json:"disable"        toml:"disable"        xml:"disable,attr"   yaml:"disable"`
+	Dynamic      bool          `json:"dynamic"        toml:"dynamic"        xml:"dynamic,attr"   yaml:"dynamic"`
+	Remote       bool          `json:"remote"         toml:"remote"         xml:"remote,attr"    yaml:"remote"`
+	RemoteAPIKey string        `json:"remote_api_key" toml:"remote_api_key" xml:"remote_api_key" yaml:"remote_api_key"`
+	Controllers  []*Controller `json:"controllers"    toml:"controller"     xml:"controller"     yaml:"controllers"`
+}
+
+// Metrics is simply a useful container for everything.
+type Metrics struct {
+	TS               time.Time
+	Sites            []*unifi.Site
+	Clients          []*unifi.Client
+	SitesDPI         []*unifi.DPITable
+	ClientsDPI       []*unifi.DPITable
+	CountryTraffic   []*unifi.UsageByCountry
+	RogueAPs         []*unifi.RogueAP
+	SpeedTests       []*unifi.SpeedTestResult
+	Devices          *unifi.Devices
+	DHCPLeases       []*unifi.DHCPLease
+	WANConfigs       []*unifi.WANEnrichedConfiguration
+	Sysinfos         []*unifi.Sysinfo
+	FirewallPolicies []*unifi.FirewallPolicy
+	Topologies       []*unifi.Topology
+	PortAnomalies    []*unifi.PortAnomaly
+	VPNMeshes        []*unifi.MagicSiteToSiteVPN
+	// Added in v5.26.0 integration:
+	WANStatuses          []*unifi.WANStatus
+	PortForwards         []*unifi.PortForward
+	SSLCertificates      []*unifi.SSLCertificate
+	UPSDevices           []*unifi.UPSDeviceSelector
+	IntegrationDevStats  []*unifi.IntegrationDeviceStats
+	WifiBroadcasts       []*unifi.WifiBroadcast
+	FirewallZones        []*unifi.FirewallZone
+	ACLRules             []*unifi.ACLRule
+	VPNServers           []*unifi.VPNServer
+	SiteToSiteTunnels    []*unifi.SiteToSiteTunnel
+	LAGs                 []*unifi.LAG
+	MCLAGDomains         []*unifi.MCLAGDomain
+	SwitchStacks         []*unifi.SwitchStack
+	DNSPolicies          []*unifi.DNSPolicy
+	RADIUSProfiles       []*unifi.RADIUSProfile
+	TrafficMatchingLists []*unifi.TrafficMatchingList
+	HotspotVouchers      []*unifi.HotspotVoucher
+	DPIApplications      []*unifi.DPIApplication
+	DPICategories        []*unifi.DPICategory
+	PendingDevices       []*unifi.PendingDevice
+	Countries            []*unifi.Country
+}
+
+func init() { // nolint: gochecknoinits
+	u := &InputUnifi{
+		dynamic: make(map[string]*Controller),
+	}
+
+	poller.NewInput(&poller.InputPlugin{
+		Name:   PluginName,
+		Input:  u, // this library implements poller.Input interface for Metrics().
+		Config: u, // Defines our config data interface.
+	})
+}
+
+// getCerts reads in cert files from disk and stores them as a slice of of byte slices.
+func (c *Controller) getCerts() ([][]byte, error) {
+	if len(c.CertPaths) == 0 {
+		return nil, nil
+	}
+
+	b := make([][]byte, len(c.CertPaths))
+
+	for i, f := range c.CertPaths {
+		d, err := os.ReadFile(f)
+		if err != nil {
+			return nil, fmt.Errorf("reading SSL cert file: %w", err)
+		}
+
+		b[i] = d
+	}
+
+	return b, nil
+}
+
+const maxAuthRetries = 5
+
+// getUnifi (re-)authenticates to a unifi controller.
+// If certificate files are provided, they are re-read.
+// On 429 Too Many Requests, retries with exponential backoff (and Retry-After when present) up to maxAuthRetries.
+func (u *InputUnifi) getUnifi(c *Controller) error {
+	u.Lock()
+	defer u.Unlock()
+
+	if c.Unifi != nil {
+		c.Unifi.CloseIdleConnections()
+	}
+
+	certs, err := c.getCerts()
+	if err != nil {
+		return err
+	}
+
+	cfg := &unifi.Config{
+		User:      c.User,
+		Pass:      c.Pass,
+		APIKey:    c.APIKey,
+		URL:       c.URL,
+		SSLCert:   certs,
+		VerifySSL: *c.VerifySSL,
+		Timeout:   c.Timeout.Duration,
+		ErrorLog:  u.LogErrorf,
+		DebugLog:  u.LogDebugf,
+	}
+
+	var lastErr error
+
+	backoff := 30 * time.Second
+
+	for attempt := 0; attempt < maxAuthRetries; attempt++ {
+		c.Unifi, lastErr = unifi.NewUnifi(cfg)
+		if lastErr == nil {
+			u.LogDebugf("Authenticated with controller successfully, %s", c.URL)
+
+			return nil
+		}
+
+		if !errors.Is(lastErr, unifi.ErrTooManyRequests) {
+			c.Unifi = nil
+
+			return fmt.Errorf("unifi controller: %w", lastErr)
+		}
+
+		var rl *unifi.RateLimitError
+		if errors.As(lastErr, &rl) && rl.RetryAfter > 0 {
+			backoff = rl.RetryAfter
+		}
+
+		if attempt < maxAuthRetries-1 {
+			u.Logf("Controller %s returned 429 Too Many Requests; waiting %v before retry (%d/%d)",
+				c.URL, backoff, attempt+1, maxAuthRetries)
+			time.Sleep(backoff)
+
+			if backoff < 5*time.Minute {
+				backoff = backoff * 2
+			}
+		}
+	}
+
+	c.Unifi = nil
+
+	return fmt.Errorf("unifi controller: %w (gave up after %d retries)", lastErr, maxAuthRetries)
+}
+
+// checkSites makes sure the list of provided sites exists on the controller.
+// This only runs once during initialization.
+func (u *InputUnifi) checkSites(c *Controller) error {
+	u.RLock()
+	defer u.RUnlock()
+
+	if len(c.Sites) == 0 || c.Sites[0] == "" {
+		c.Sites = []string{"all"}
+	}
+
+	u.LogDebugf("Checking Controller Sites List")
+
+	sites, err := c.Unifi.GetSites()
+	if err != nil {
+		return fmt.Errorf("controller: %w", err)
+	}
+
+	msg := []string{}
+	for _, site := range sites {
+		msg = append(msg, site.Name+" ("+site.Desc+")")
+	}
+
+	u.Logf("Found %d site(s) on controller %s: %v", len(msg), c.URL, strings.Join(msg, ", "))
+
+	if StringInSlice("all", c.Sites) {
+		c.Sites = []string{"all"}
+
+		return nil
+	}
+
+	keep := []string{}
+
+FIRST:
+	for _, s := range c.Sites {
+		for _, site := range sites {
+			// Case-insensitive comparison for site names
+			if strings.EqualFold(s, site.Name) {
+				keep = append(keep, s)
+
+				continue FIRST
+			}
+		}
+
+		u.LogErrorf("Configured site not found on controller %s: %v", c.URL, s)
+	}
+
+	if c.Sites = keep; len(keep) == 0 {
+		c.Sites = []string{"all"}
+	}
+
+	return nil
+}
+
+func (u *InputUnifi) getPassFromFile(filename string) string {
+	b, err := os.ReadFile(filename)
+	if err != nil {
+		u.LogErrorf("Reading UniFi Password File: %v", err)
+	}
+
+	return strings.TrimSpace(string(b))
+}
+
+// setDefaults sets the default defaults.
+func (u *InputUnifi) setDefaults(c *Controller) { //nolint:cyclop
+	t := true
+	f := false
+
+	// Default defaults.
+	if c.SaveSites == nil {
+		c.SaveSites = &t
+	}
+
+	if c.VerifySSL == nil {
+		c.VerifySSL = &f
+	}
+
+	if c.HashPII == nil {
+		c.HashPII = &f
+	}
+
+	if c.DropPII == nil {
+		c.DropPII = &f
+	}
+
+	if c.SaveDPI == nil {
+		c.SaveDPI = &f
+	}
+
+	if c.SaveTraffic == nil {
+		c.SaveTraffic = &f
+	}
+
+	if c.SaveRogue == nil {
+		c.SaveRogue = &f
+	}
+
+	if c.SaveIDs == nil {
+		c.SaveIDs = &f
+	}
+
+	if c.SaveEvents == nil {
+		c.SaveEvents = &f
+	}
+
+	if c.SaveSyslog == nil {
+		c.SaveSyslog = &f
+	}
+
+	if c.SaveProtectLogs == nil {
+		c.SaveProtectLogs = &f
+	}
+
+	if c.ProtectThumbnails == nil {
+		c.ProtectThumbnails = &f
+	}
+
+	if c.SaveAlarms == nil {
+		c.SaveAlarms = &f
+	}
+
+	if c.SaveAnomal == nil {
+		c.SaveAnomal = &f
+	}
+
+	if c.SaveTraffic == nil {
+		c.SaveTraffic = &f
+	}
+
+	if c.URL == "" && !c.Remote {
+		// Remote mode: URL will be set during discovery
+		// Don't set a default here for remote mode
+		c.URL = defaultURL
+	}
+
+	if strings.HasPrefix(c.Pass, "file://") {
+		c.Pass = u.getPassFromFile(strings.TrimPrefix(c.Pass, "file://"))
+	}
+
+	if strings.HasPrefix(c.APIKey, "file://") {
+		c.APIKey = u.getPassFromFile(strings.TrimPrefix(c.APIKey, "file://"))
+	}
+
+	if c.Remote {
+		// Remote mode: only API key is used, no user/pass
+		// For remote mode, API key is required
+		// Will be set from RemoteAPIKey in Config if not provided
+		c.User = ""
+		c.Pass = ""
+	} else {
+		// Local mode: use API key if provided, otherwise user/pass
+		if c.APIKey == "" {
+			if c.Pass == "" {
+				c.Pass = defaultPass
+			}
+
+			if c.User == "" {
+				c.User = defaultUser
+			}
+		} else {
+			// clear out user/pass combo, only use API-key
+			c.User = ""
+			c.Pass = ""
+		}
+	}
+
+	if len(c.Sites) == 0 {
+		c.Sites = []string{defaultSite}
+	}
+
+	if c.Timeout.Duration == 0 {
+		c.Timeout.Duration = defaultTimeout
+	}
+}
+
+// setControllerDefaults sets defaults for the for controllers.
+// Any missing values come from defaults (above).
+func (u *InputUnifi) setControllerDefaults(c *Controller) *Controller { //nolint:cyclop,funlen
+	// Configured controller defaults.
+	if c.SaveSites == nil {
+		c.SaveSites = u.Default.SaveSites
+	}
+
+	if c.VerifySSL == nil {
+		c.VerifySSL = u.Default.VerifySSL
+	}
+
+	if c.CertPaths == nil {
+		c.CertPaths = u.Default.CertPaths
+	}
+
+	if c.HashPII == nil {
+		c.HashPII = u.Default.HashPII
+	}
+
+	if c.DropPII == nil {
+		c.DropPII = u.Default.DropPII
+	}
+
+	if c.SaveDPI == nil {
+		c.SaveDPI = u.Default.SaveDPI
+	}
+
+	if c.SaveTraffic == nil {
+		c.SaveTraffic = u.Default.SaveTraffic
+	}
+
+	if c.SaveIDs == nil {
+		c.SaveIDs = u.Default.SaveIDs
+	}
+
+	if c.SaveRogue == nil {
+		c.SaveRogue = u.Default.SaveRogue
+	}
+
+	if c.SaveEvents == nil {
+		c.SaveEvents = u.Default.SaveEvents
+	}
+
+	if c.SaveSyslog == nil {
+		c.SaveSyslog = u.Default.SaveSyslog
+	}
+
+	if c.SaveProtectLogs == nil {
+		c.SaveProtectLogs = u.Default.SaveProtectLogs
+	}
+
+	if c.ProtectThumbnails == nil {
+		c.ProtectThumbnails = u.Default.ProtectThumbnails
+	}
+
+	if c.SaveAlarms == nil {
+		c.SaveAlarms = u.Default.SaveAlarms
+	}
+
+	if c.SaveAnomal == nil {
+		c.SaveAnomal = u.Default.SaveAnomal
+	}
+
+	if c.URL == "" && !c.Remote {
+		// Remote mode: URL will be set during discovery
+		// Don't set a default here for remote mode
+		c.URL = u.Default.URL
+		if c.URL == "" {
+			c.URL = defaultURL
+		}
+	}
+
+	if strings.HasPrefix(c.Pass, "file://") {
+		c.Pass = u.getPassFromFile(strings.TrimPrefix(c.Pass, "file://"))
+	}
+
+	if strings.HasPrefix(c.APIKey, "file://") {
+		c.APIKey = u.getPassFromFile(strings.TrimPrefix(c.APIKey, "file://"))
+	}
+
+	if c.Remote {
+		// Remote mode: only API key is used
+		if c.APIKey == "" {
+			c.APIKey = u.Default.APIKey
+		}
+
+		c.User = ""
+		c.Pass = ""
+	} else {
+		// Local mode: use API key if provided, otherwise user/pass
+		if c.APIKey == "" {
+			if c.Pass == "" {
+				c.Pass = u.Default.Pass
+				if c.Pass == "" {
+					c.Pass = defaultPass
+				}
+			}
+
+			if c.User == "" {
+				c.User = u.Default.User
+				if c.User == "" {
+					c.User = defaultUser
+				}
+			}
+		} else {
+			// clear out user/pass combo, only use API-key
+			c.User = ""
+			c.Pass = ""
+		}
+	}
+
+	if len(c.Sites) == 0 {
+		c.Sites = u.Default.Sites
+	}
+
+	// Added handling for the new default_site_name_override parameter.
+	if c.DefaultSiteNameOverride == "" {
+		c.DefaultSiteNameOverride = u.Default.DefaultSiteNameOverride
+	}
+
+	if c.Timeout.Duration == 0 {
+		c.Timeout = u.Default.Timeout
+	}
+
+	return c
+}
+
+// StringInSlice returns true if a string is in a slice.
+func StringInSlice(str string, slice []string) bool {
+	for _, s := range slice {
+		if strings.EqualFold(s, str) {
+			return true
+		}
+	}
+
+	return false
+}

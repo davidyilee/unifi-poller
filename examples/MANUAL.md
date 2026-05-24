@@ -1,9 +1,9 @@
-unifi-poller(1) -- Utility to poll UniFi Controller Metrics and store them in InfluxDB
+unpoller(1) -- Utility to poll UniFi Controller Metrics and store them in InfluxDB
 ===
 
 SYNOPSIS
 ---
-`unifi-poller -c /etc/unifi-poller/up.conf`
+`unpoller -c /etc/unpoller/up.conf`
 
 This daemon polls a UniFi controller at a short interval and stores the collected
 measurements in an Influx Database. The measurements and metrics collected belong
@@ -11,7 +11,7 @@ to every available site, device and client found on the controller. Including
 UniFi Security Gateways, Access Points, Switches and possibly more.
 
 Dashboards for Grafana are available.
-Find them at [Grafana.com](https://grafana.com/dashboards?search=unifi-poller).
+Find them at [Grafana.com](https://grafana.com/dashboards?search=unpoller).
 
 DESCRIPTION
 ---
@@ -24,14 +24,31 @@ examples and default configurations.
 
 OPTIONS
 ---
-`unifi-poller [-c <config-file>,[config-file]] [-j <filter>] [-h] [-v]`
+`unpoller [-c <config-file>,[config-file]] [-j <filter>] [-e <pass>] [--health] [-d] [-h] [-v]`
 
     -c, --config <config-file>,[config-file]
         Provide a configuration file (instead of the default). You may provide
         multiple file paths separated by commas. The first file found is used.
 
+    -e, --encrypt <password|->
+        Encrypts a password with bcrypt. This is useful to make an account
+        password for the built-in web server. You may provide the password
+        on the CLI, or use "-" as the pass to be prompted for the password
+        without echo.
+
     -v, --version
         Display version and exit.
+
+    --health
+        Run a health check and exit with status 0 (healthy) or 1 (unhealthy).
+        This validates the configuration file, ensures input and output plugins
+        are properly configured, and performs basic connectivity checks. Useful
+        for Docker HEALTHCHECK and container orchestration readiness probes.
+
+    -d, --debugio
+        Debug the inputs and outputs configured and exit. This performs more
+        verbose validation checks than --health and is useful for troubleshooting
+        configuration issues.
 
     -j, --dumpjson <filter>
         This is a debug option; use this when you are missing data in your graphs,
@@ -44,7 +61,7 @@ OPTIONS
         printing the JSON payload; it does not daemonize or report to InfluxDB
         with this option. The `other` option is special. This allows you request
         any api path. It must be enclosed in quotes with the word other. Example:
-           unifi-poller -j "other /stat/admins"
+           unpoller -j "other /stat/admins"
 
     -h, --help
         Display usage and exit.
@@ -52,30 +69,31 @@ OPTIONS
 CONFIGURATION
 ---
 *   Config File Default Location:
-    *   Mac/BSD: `/usr/local/etc/unifi-poller/up.conf`
-    *   Windows: `C:\\ProgramData\\unifi-poller\\up.conf`
-    *   Others:  `/etc/unifi-poller/up.conf`
+    *   Mac/BSD: `/usr/local/etc/unpoller/up.conf`
+    *   Windows: `C:\\ProgramData\\unpoller\\up.conf`
+    *   Others:  `/etc/unpoller/up.conf`
 *   Config File Default Format: `TOML`
-*   Possible formats: `XML`, `JSON`, `TOML`, `YAML`
+*   Possible formats: `JSON`, `TOML`, `YAML`
 
 The config file can be written in four different syntax formats. The application
-decides which one to use based on the file's name. If it contains `.xml` it will
-be parsed as XML. The same goes for `.json` and `.yaml`. If the filename contains
-none of these strings, then it is parsed as the default format, TOML. This option
-is provided so the application can be easily adapted to any environment.
+decides which one to use based on the file's name. If it contains `.json` it will
+be parsed as JSON. The same goes for `.yaml`. If the filename contains neither
+of these strings, then it is parsed as the default format, TOML. This feature
+is provided so the application can be easily adapted to any environment. `XML`
+used to work but no longer does.
 
 `Config File Parameters`
 
 Configuration file (up.conf) parameters are documented in the wiki.
 
-*   [https://github.com/unifi-poller/unifi-poller/wiki/Configuration](https://github.com/unifi-poller/unifi-poller/wiki/Configuration)
+*   [https://github.com/unpoller/unpoller/wiki/Configuration](https://github.com/unpoller/unpoller/wiki/Configuration)
 
 `Shell Environment Parameters`
 
 This application can be fully configured using shell environment variables.
 Find documentation for this feature on the Docker Wiki page, and the above Configuration wiki.
 
-*   [https://github.com/unifi-poller/unifi-poller/wiki/Docker](https://github.com/unifi-poller/unifi-poller/wiki/Docker)
+*   [https://github.com/unpoller/unpoller/wiki/Docker](https://github.com/unpoller/unpoller/wiki/Docker)
 
 GO DURATION
 ---
@@ -97,6 +115,6 @@ AUTHOR
 
 LOCATION
 ---
-*   UniFi Poller: [https://golift.io/unifi-poller/](https://golift.io/unifi-poller/)
-*   UniFi Library: [https://github.com/unifi-poller/unifi](https://github.com/unifi-poller/unifi)
-*   Grafana Dashboards: [https://grafana.com/dashboards?search=unifi-poller](https://grafana.com/dashboards?search=unifi-poller)
+*   UniFi Poller: [https://golift.io/unpoller/](https://golift.io/unpoller/)
+*   UniFi Library: [https://github.com/unpoller/unifi](https://github.com/unpoller/unifi)
+*   Grafana Dashboards: [https://grafana.com/dashboards?search=unpoller](https://grafana.com/dashboards?search=unpoller)

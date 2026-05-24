@@ -1,0 +1,236 @@
+package poller
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+
+	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/term"
+)
+
+// PrintRawMetrics prints raw json from the UniFi Controller. This is currently
+// tied into the -j CLI arg, and is probably not very useful outside that context.
+func (u *UnifiPoller) PrintRawMetrics() (err error) {
+	split := strings.SplitN(u.Flags.DumpJSON, " ", 2)
+	filter := &Filter{Kind: split[0]}
+
+	// Allows you to grab a controller other than 0 from config.
+	if split2 := strings.Split(filter.Kind, ":"); len(split2) > 1 {
+		filter.Kind = split2[0]
+		filter.Unit, _ = strconv.Atoi(split2[1])
+	}
+
+	// Used with "other"
+	if len(split) > 1 {
+		filter.Path = split[1]
+	}
+
+	// As of now we only have one input plugin, so target that [0].
+	m, err := inputs[0].RawMetrics(filter)
+	fmt.Println(string(m))
+
+	return err
+}
+
+// PrintPasswordHash prints a bcrypt'd password. Useful for the web server.
+func (u *UnifiPoller) PrintPasswordHash() (err error) {
+	pwd := []byte(u.Flags.HashPW)
+
+	if u.Flags.HashPW == "-" {
+		fmt.Print("Enter Password: ")
+
+		pwd, err = term.ReadPassword(int(os.Stdin.Fd()))
+		if err != nil {
+			return fmt.Errorf("reading stdin: %w", err)
+		}
+
+		fmt.Println() // print a newline.
+	}
+
+	hash, err := bcrypt.GenerateFromPassword(pwd, bcrypt.MinCost)
+	fmt.Println(string(hash))
+
+	return err //nolint:wrapcheck
+}
+
+func (u *UnifiPoller) DebugIO() error {
+	inputSync.RLock()
+	defer inputSync.RUnlock()
+
+	outputSync.RLock()
+	defer outputSync.RUnlock()
+
+	allOK := true
+
+	var allErr error
+
+	u.Logf("Checking inputs...")
+
+	totalInputs := len(inputs)
+
+	for i, input := range inputs {
+		u.Logf("\t(%d/%d) Checking input %s...", i+1, totalInputs, input.Name)
+
+		ok, err := input.DebugInput()
+		if !ok {
+			u.LogErrorf("\t\t %s Failed: %v", input.Name, err)
+
+			allOK = false
+		} else {
+			u.Logf("\t\t %s is OK", input.Name)
+		}
+
+		if err != nil {
+			if allErr == nil {
+				allErr = err
+			} else {
+				allErr = fmt.Errorf("%v: %w", err, allErr)
+			}
+		}
+	}
+
+	u.Logf("Checking outputs...")
+
+	totalOutputs := len(outputs)
+
+	for i, output := range outputs {
+		u.Logf("\t(%d/%d) Checking output %s...", i+1, totalOutputs, output.Name)
+
+		ok, err := output.DebugOutput()
+		if !ok {
+			u.LogErrorf("\t\t %s Failed: %v", output.Name, err)
+
+			allOK = false
+		} else {
+			u.Logf("\t\t %s is OK", output.Name)
+		}
+
+		if err != nil {
+			if allErr == nil {
+				allErr = err
+			} else {
+				allErr = fmt.Errorf("%v: %w", err, allErr)
+			}
+		}
+	}
+
+	if !allOK {
+		u.LogErrorf("No all checks passed, please fix the logged issues.")
+	}
+
+	return allErr
+}
+
+// HealthCheck performs a basic health check suitable for Docker HEALTHCHECK.
+// It validates configuration and checks if inputs/outputs are properly configured.
+// Returns nil (exit 0) if healthy, error (exit 1) if unhealthy.
+func (u *UnifiPoller) HealthCheck() error {
+	// Enable health check mode to skip network binding in output validation.
+	SetHealthCheckMode(true)
+	defer SetHealthCheckMode(false)
+
+	// Silence output for health checks (Docker doesn't need verbose logs).
+	u.Quiet = true
+
+	// Load configuration.
+	cfile, err := getFirstFile(strings.Split(u.Flags.ConfigFile, ","))
+	if err != nil {
+		return fmt.Errorf("health check failed: config file not found: %w", err)
+	}
+
+	u.Flags.ConfigFile = cfile
+
+	if err := u.ParseConfigs(); err != nil {
+		return fmt.Errorf("health check failed: config parse error: %w", err)
+	}
+
+	inputSync.RLock()
+	defer inputSync.RUnlock()
+
+	outputSync.RLock()
+	defer outputSync.RUnlock()
+
+	// Check that we have at least one input and one output configured.
+	if len(inputs) == 0 {
+		return fmt.Errorf("health check failed: no input plugins configured")
+	}
+
+	if len(outputs) == 0 {
+		return fmt.Errorf("health check failed: no output plugins configured")
+	}
+
+	// Check if at least one output is enabled.
+	hasEnabledOutput := false
+
+	for _, output := range outputs {
+		if output.Enabled() {
+			hasEnabledOutput = true
+
+			break
+		}
+	}
+
+	if !hasEnabledOutput {
+		return fmt.Errorf("health check failed: no enabled output plugins")
+	}
+
+	// Perform configuration validation on enabled outputs.
+	// Network binding checks will be skipped automatically due to health check mode.
+	for _, output := range outputs {
+		if !output.Enabled() {
+			continue
+		}
+
+		ok, err := output.DebugOutput()
+		if !ok || err != nil {
+			return fmt.Errorf("health check failed: output %s validation failed: %w", output.Name, err)
+		}
+	}
+
+	// All checks passed, application is healthy.
+	return nil
+}
+
+// RunDiscover loads config, initializes inputs, finds an input that implements
+// Discoverer, and runs Discover(outputPath). Uses the same config as normal polling.
+func (u *UnifiPoller) RunDiscover() error {
+	cfile, err := getFirstFile(strings.Split(u.Flags.ConfigFile, ","))
+	if err != nil {
+		return fmt.Errorf("discover: config file not found: %w", err)
+	}
+
+	u.Flags.ConfigFile = cfile
+	u.Logf("Loading Configuration File: %s", u.Flags.ConfigFile)
+
+	if err := u.ParseConfigs(); err != nil {
+		return fmt.Errorf("discover: parse config: %w", err)
+	}
+
+	if err := u.InitializeInputs(); err != nil {
+		return fmt.Errorf("discover: initialize inputs: %w", err)
+	}
+
+	outputPath := u.Flags.DiscoverOutput
+	if outputPath == "" {
+		outputPath = "api_endpoints_discovery.md"
+	}
+
+	inputSync.RLock()
+	defer inputSync.RUnlock()
+
+	for _, input := range inputs {
+		if d, ok := input.Input.(Discoverer); ok {
+			if err := d.Discover(outputPath); err != nil {
+				return fmt.Errorf("discover: %w", err)
+			}
+
+			u.Logf("Discovery report written to %s (share with maintainers for API/404 issues).", outputPath)
+
+			return nil
+		}
+	}
+
+	return fmt.Errorf("discover: no input plugin supports discovery (unifi input required)")
+}
